@@ -1,0 +1,28 @@
+{
+  "source_image": "new_data/img_test_8.png",
+  "reconstructed": [
+    {
+      "paragraph": 0,
+      "text_no_punct": "She is studying English at school\nune\nThey live .",
+      "text": "She is studying English at school une They live."
+    },
+    {
+      "paragraph": 1,
+      "text_no_punct": "My favorite color is blue .\nHe plays videogames .",
+      "text": "My favorite color is blue. He plays videogames."
+    },
+    {
+      "paragraph": 2,
+      "text_no_punct": "are going to the park tomorrow\nin a city .\nI am happy",
+      "text": "are going to the park tomorrow in a city. I am happy"
+    },
+    {
+      "paragraph": 3,
+      "text_no_punct": "I read books .",
+      "text": "I read books."
+    }
+  ],
+  "full_text_no_punct": "She is studying English at school\nune\nThey live .\n\nMy favorite color is blue .\nHe plays videogames .\n\nare going to the park tomorrow\nin a city .\nI am happy\n\nI read books .",
+  "full_text": "She is studying English at school une They live.\n\nMy favorite color is blue. He plays videogames.\n\nare going to the park tomorrow in a city. I am happy\n\nI read books.",
+  "columns_detected": 2
+}
