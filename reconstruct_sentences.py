@@ -1,287 +1,158 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, math
+"""
+reconstruct_sentences.py (minimal LLM post-edit, robust)
+- Reads OCR text from ocr_results.json
+- Sends it to a seq2seq LLM with a copyediting prompt
+- Writes final text (and optional title)
+- Preserves ALL lines; falls back to per-line editing if needed
+- Graceful fallback if transformers is missing (returns precleaned OCR)
+
+Usage:
+  python3 reconstruct_sentences.py <folder|manifest.json> [--ocr OCR_PATH]
+    [--fix_model google/flan-t5-large] [--max_new_tokens 512]
+    [--title] [--title_model MODEL] [--title_max_new_tokens 32]
+    [--no_tiny_cleanup]
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import re
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import Optional
 
-import numpy as np
-
-# PONCTUATION (optionnelle)
 _HAS_TRANSFORMERS = False
 try:
-    from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
     _HAS_TRANSFORMERS = True
 except Exception:
-    pass
+    _HAS_TRANSFORMERS = False
 
 
-@dataclass
-class Box:
-    x0: int
-    y0: int
-    x1: int
-    y1: int
+# ====== Prompts ======
+# Global prompt: insist on preserving ALL lines and counts.
+PROMPT_FIX_EN = (
+    "Fix the following text in English. You have to detect all the words and anomalies in the sentences. Put them together to make the text readble\n"
+    "Delete all the sentences which are not english\n"
+    "Text :\n\n"
+)
 
-    @property
-    def w(self): return max(0, self.x1 - self.x0)
-    @property
-    def h(self): return max(0, self.y1 - self.y0)
-    @property
-    def cx(self): return self.x0 + self.w / 2.0
-    @property
-    def cy(self): return self.y0 + self.h / 2.0
+PROMPT_TITLE_EN = (
+    "Suggest a concise (≤8 words), informative, natural title for this text. "
+    "Answer with the title only:\n\n"
+)
 
 
-@dataclass
-class Token:
-    text: str
-    box: Box
-    path: str
+# ====== I/O helpers ======
+def load_ocr_text(ocr_path: Path) -> str:
+    data = json.loads(ocr_path.read_text(encoding="utf-8"))
+    if isinstance(data.get("full_text"), str) and data["full_text"].strip():
+        return data["full_text"].strip()
+    results = data.get("results", [])
+    lines = [r.get("text", "") for r in results if isinstance(r.get("text", ""), str)]
+    return "\n".join([t for t in lines if t.strip()]).strip()
 
 
-def load_inputs(manifest_path: Path, ocr_path: Path) -> List[Token]:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    ocr = json.loads(ocr_path.read_text(encoding="utf-8"))
-    # Associer par chemin (clé)
-    text_by_path = { Path(r["path"]).as_posix(): r["text"] for r in ocr.get("results", []) }
-
-    tokens: List[Token] = []
-    for c in manifest.get("crops", []):
-        p = Path(c["path"]).as_posix()
-        t = text_by_path.get(p, "")
-        if not isinstance(t, str):
-            t = ""
-        # Décomposer en "mots" (simple split). On garde quand même le crop entier comme *ligne* si nécessaire.
-        # Ici : on considère le crop comme un token (mot/mini-ligne) pour rester générique,
-        # car tu as déjà segmenté en "word" ou "line" côté segmenter.
-        if t.strip() == "":
-            continue
-        x0, y0, x1, y1 = c["bbox_abs"]
-        tokens.append(Token(text=t.strip(), box=Box(int(x0), int(y0), int(x1), int(y1)), path=p))
-    return tokens, manifest
+# ====== Light cleanup (pre & post) ======
+def light_preclean(t: str) -> str:
+    if not t:
+        return t
+    s = t.replace("\u00a0", " ")  # NBSP -> space
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\s+([,;:.!?])", r"\1", s)   # no space before punctuation
+    s = re.sub(r"([.?!]){2,}", r".", s)      # collapse repeated end-punct
+    # common OCR digit/letter confusions inside words
+    s = re.sub(r"(?<=[A-Za-z])0(?=[A-Za-z])", "o", s)
+    s = re.sub(r"(?<=[A-Za-z])1(?=[A-Za-z])", "l", s)
+    # normalize weird dashes to hyphen
+    s = s.replace("–", "-").replace("—", "-").replace("-", "-")
+    return s.strip()
 
 
-def auto_columns(tokens: List[Token], n_columns: Optional[int] = None) -> List[int]:
-    """
-    Retourne un label de colonne pour chaque token.
-    Heuristique 1D : on trie par x0 et on découpe selon les grands "sauts".
-    Si n_columns est fixé, on coupe en quantiles; sinon on détecte automatiquement via un seuil sur les gaps.
-    """
-    if not tokens:
-        return []
-
-    order = np.argsort([t.box.x0 for t in tokens])
-    x0_sorted = np.array([tokens[i].box.x0 for i in order], dtype=float)
-    gaps = np.diff(x0_sorted)
-
-    if n_columns and n_columns > 1:
-        # couper en n_columns via quantiles des x0
-        q = np.linspace(0, 1, n_columns + 1)
-        bounds = np.quantile(x0_sorted, q)
-        cols = np.zeros(len(tokens), dtype=int)
-        for rank, i in enumerate(order):
-            x = tokens[i].box.x0
-            # trouver l'intervalle
-            k = np.searchsorted(bounds, x, side="right") - 1
-            k = min(max(k, 0), n_columns - 1)
-            cols[i] = k
-        return cols.tolist()
-
-    # auto: grand gap = nouvelle colonne
-    if len(gaps) == 0:
-        return [0] * len(tokens)
-
-    med = float(np.median(gaps))
-    iqr = float(np.percentile(gaps, 75) - np.percentile(gaps, 25))
-    thresh = med + 2.5 * iqr if iqr > 0 else med * 2.0
-    thresh = max(thresh, 40.0)  # garde-fou absolu
-
-    labels = np.zeros(len(tokens), dtype=int)
-    col = 0
-    prev = x0_sorted[0]
-    for pos, i in enumerate(order):
-        if pos > 0 and (x0_sorted[pos] - prev) > thresh:
-            col += 1
-        labels[i] = col
-        prev = x0_sorted[pos]
-    return labels.tolist()
+def tiny_cleanup(s: str) -> str:
+    """Small deterministic cleanup after the LLM to guarantee removal of common OCR noise."""
+    if not s:
+        return s
+    s = re.sub(r"^\s*Output:\s*", "", s, flags=re.IGNORECASE)  # remove 'Output:' prefix if echoed
+    s = re.sub(r"\b0 0\b", "", s)                              # remove '0 0' noise
+    s = re.sub(r"(?<=[A-Za-z])0(?=[A-Za-z])", "o", s)
+    s = re.sub(r"(?<=[A-Za-z])1(?=[A-Za-z])", "l", s)
+    # remove isolated single letters that stand alone as tokens (common stray 't', 'i' etc.)
+    s = re.sub(r"(?:^|\s)\b([A-Za-z])\b(?:[. ]+|$)", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Capitalize sentence starts
+    def cap(m):
+        return m.group(1) + m.group(2).upper()
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", cap, s)
+    return s
 
 
-def group_lines(tokens: List[Token], line_tol: float = 0.6) -> List[List[int]]:
-    """
-    Regroupe en lignes en se basant sur la proximité verticale des centres Y + chevauchement vertical.
-    line_tol est un facteur *hauteur moyenne* pour tolérer les variations.
-    Retourne une liste de groupes, chaque groupe est une liste d'indices dans 'tokens'.
-    """
-    if not tokens:
-        return []
-
-    # Trier par centre Y
-    idxs = list(range(len(tokens)))
-    idxs.sort(key=lambda i: tokens[i].box.cy)
-
-    # hauteur médiane pour seuils
-    heights = np.array([tokens[i].box.h for i in idxs], dtype=float)
-    h_med = float(np.median(heights)) if heights.size else 20.0
-    band = max(10.0, line_tol * h_med)
-
-    groups: List[List[int]] = []
-    current: List[int] = []
-    last_cy = None
-
-    for i in idxs:
-        cy = tokens[i].box.cy
-        if last_cy is None:
-            current = [i]
-            last_cy = cy
-            continue
-        # même ligne si |Δcy| <= band OU si fort chevauchement vertical
-        same_line = abs(cy - last_cy) <= band
-        if not same_line:
-            # nouveau groupe
-            groups.append(sorted(current, key=lambda j: tokens[j].box.x0))
-            current = [i]
-        else:
-            current.append(i)
-        last_cy = cy
-
-    if current:
-        groups.append(sorted(current, key=lambda j: tokens[j].box.x0))
-
-    return groups
-
-
-def lines_to_paragraphs(lines: List[List[int]], tokens: List[Token], para_factor: float = 1.6) -> List[List[List[int]]]:
-    """
-    Regroupe des lignes en paragraphes selon le gap vertical inter-lignes.
-    para_factor * median_line_gap sert de seuil.
-    """
-    if not lines:
-        return []
-
-    # Gap vertical entre lignes = distance entre y0 de la ligne N+1 et y1 de la ligne N
-    def line_top(g): return min(tokens[i].box.y0 for i in g)
-    def line_bottom(g): return max(tokens[i].box.y1 for i in g)
-
-    line_tops = [line_top(g) for g in lines]
-    line_bottoms = [line_bottom(g) for g in lines]
-    gaps = [max(0, line_tops[i+1] - line_bottoms[i]) for i in range(len(lines)-1)]
-    med_gap = float(np.median(gaps)) if gaps else 0.0
-    thresh = (para_factor * med_gap) if med_gap > 0 else 30.0  # seuil de base
-
-    paragraphs: List[List[List[int]]] = []
-    current: List[List[int]] = [lines[0]]
-    for i in range(1, len(lines)):
-        gap = max(0, line_tops[i] - line_bottoms[i-1])
-        if gap > thresh:
-            paragraphs.append(current)
-            current = [lines[i]]
-        else:
-            current.append(lines[i])
-    if current:
-        paragraphs.append(current)
-    return paragraphs
-
-
-def reconstruct_line(words: List[Token], space_factor: float = 0.33) -> str:
-    """
-    Reconstruit une ligne : insertion d'espaces selon gap relatif aux largeurs des mots.
-    - On insère un espace si gap_x > space_factor * median_word_width.
-    - Gestion simple des césures: si mot se termine par '-' et que le suivant commence en minuscule, on colle.
-    """
-    if not words:
-        return ""
-
-    # Ordre gauche->droite
-    words = sorted(words, key=lambda t: t.box.x0)
-    widths = np.array([w.box.w for w in words], dtype=float)
-    med_w = float(np.median(widths)) if widths.size else 20.0
-    pieces = [words[0].text]
-
-    for prev, cur in zip(words[:-1], words[1:]):
-        gap = cur.box.x0 - prev.box.x1
-        need_space = gap > (space_factor * med_w)
-
-        if pieces[-1].endswith("-") and cur.text and cur.text[0].islower():
-            # césure : pas d'espace et retire '-'
-            pieces[-1] = pieces[-1][:-1] + cur.text
-        else:
-            if need_space:
-                pieces.append(" " + cur.text)
-            else:
-                # souvent collé = fin de mot + début de mot → insérer espace min si
-                # le dernier char est lettre/chiffre et le premier aussi
-                if pieces[-1] and pieces[-1][-1].isalnum() and cur.text[0].isalnum():
-                    pieces.append(" " + cur.text)
-                else:
-                    pieces.append(cur.text)
-
-    return "".join(pieces).strip()
-
-
-def apply_punctuation(text: str,
-                      model_name: str = "oliverguhr/fullstop-punctuation-multilang-large",
-                      device: int = -1) -> str:
-    """
-    Applique une restauration de ponctuation simple via un modèle token-classification.
-    Ce modèle prédit des tags type 'O', 'COMMA', 'PERIOD', 'QUESTION', ... après chaque jeton.
-    Si indisponible, renvoie le texte inchangé.
-    """
+# ====== LLM runner ======
+def run_seq2seq(prompt: str, model_name: str, max_new_tokens: int) -> str:
     if not _HAS_TRANSFORMERS:
-        return text
+        # Fallback: return the input text part (after "Text:\n") if transformers is unavailable
+        return prompt.split("\n\nText:\n", 1)[-1].strip()
     try:
         tok = AutoTokenizer.from_pretrained(model_name)
-        mdl = AutoModelForTokenClassification.from_pretrained(model_name)
-        nlp = pipeline("token-classification", model=mdl, tokenizer=tok, aggregation_strategy="simple", device=device)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        inp = tok(prompt, return_tensors="pt", truncation=True)
+        ids = mdl.generate(
+            **inp,
+            max_new_tokens=max_new_tokens,
+            num_beams=5,
+            length_penalty=0.9,
+            early_stopping=True,
+            no_repeat_ngram_size=3,
+        )
+        return tok.decode(ids[0], skip_special_tokens=True).strip()
     except Exception:
-        return text
-
-    # Tokeniser par espaces (le modèle s’en sort généralement)
-    words = text.split()
-    if not words:
-        return text
-
-    # Limiter la longueur par batch si nécessaire
-    out_tokens = []
-    batch_size = 128
-    for s in range(0, len(words), batch_size):
-        seg = words[s:s+batch_size]
-        res = nlp(" ".join(seg))
-        # res = liste de dicts avec 'word' et 'entity_group'
-        punct_map = {
-            "COMMA": ",",
-            "PERIOD": ".",
-            "QUESTION": "?",
-            "EXCLAMATION": "!",
-            "COLON": ":",
-            "SEMICOLON": ";"
-        }
-        # On reconstruit : mot + ponctuation si prédite
-        for r in res:
-            w = r.get("word", "")
-            ent = r.get("entity_group", "O")
-            p = punct_map.get(ent, "")
-            if w:
-                out_tokens.append(w + p)
-    # Post: espace après .,? etc. (sauf si déjà présent)
-    txt = " ".join(out_tokens)
-    txt = txt.replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?").replace(" :", ":").replace(" ;", ";")
-    return txt
+        # If anything fails, return the raw text (still better than crashing)
+        return prompt.split("\n\nText:\n", 1)[-1].strip()
 
 
+def fix_per_line(text: str, model_name: str, max_new_tokens: int) -> str:
+    """Edit each line independently to strictly preserve line count."""
+    lines = text.splitlines()
+    out_lines = []
+    for ln in lines:
+        if not ln.strip():
+            out_lines.append("")  # preserve blank lines
+            continue
+        prompt = (
+            "Edit ONLY this one line. Keep its meaning and keep all words unless they are clear OCR noise. "
+            "Fix spelling, grammar, casing, spacing, and punctuation; remove OCR noise (0→o, 1→l). "
+            "Return ONLY the corrected line:\n\n"
+            f"{ln.strip()}"
+        )
+        y = run_seq2seq(prompt, model_name, max_new_tokens)
+        y = re.sub(r"^\s*Output:\s*", "", y, flags=re.IGNORECASE).strip()
+        out_lines.append(y)
+    return "\n".join(out_lines)
+
+
+# ====== Main ======
 def main():
-    ap = argparse.ArgumentParser(description="Reconstruction de phrases à partir des crops + OCR (mot/ligne).")
-    ap.add_argument("input", help="Dossier des crops (contenant manifest.json et ocr_results.json) OU chemin vers manifest.json")
-    ap.add_argument("--ocr", help="Chemin vers ocr_results.json (sinon déduit du dossier/manifest)")
-    ap.add_argument("--n_columns", type=int, default=None, help="Nombre de colonnes (auto si non fourni)")
-    ap.add_argument("--line_tol", type=float, default=0.6, help="Tolérance de regroupement vertical (× hauteur médiane)")
-    ap.add_argument("--space_factor", type=float, default=0.33, help="Seuil espace = factor × largeur médiane du mot")
-    ap.add_argument("--para_factor", type=float, default=1.6, help="Seuil paragraphe = factor × gap médian inter-lignes")
-    ap.add_argument("--punct", action="store_true", help="Activer restauration de ponctuation")
-    ap.add_argument("--punct_model", default="oliverguhr/fullstop-punctuation-multilang-large", help="Nom du modèle de ponctuation HF")
-    ap.add_argument("--device", type=int, default=-1, help="Device HF (-1 CPU, >=0 GPU/MPS si supporté)")
+    ap = argparse.ArgumentParser(description="Minimal LLM post-edit on OCR text (line-preserving).")
+    ap.add_argument("input", help="Folder with manifest.json + ocr_results.json OR the manifest.json path")
+    ap.add_argument("--ocr", help="Path to ocr_results.json (else inferred)")
+
+    # Models & gen params
+    ap.add_argument("--fix_model", default="google/flan-t5-large", help="Seq2seq model for copyediting")
+    ap.add_argument("--max_new_tokens", type=int, default=512, help="Max new tokens for the copyedit model")
+
+    # Optional title
+    ap.add_argument("--title", action="store_true", help="Also generate a title")
+    ap.add_argument("--title_model", default=None, help="Optional different model for title generation")
+    ap.add_argument("--title_max_new_tokens", type=int, default=32, help="Max new tokens for title")
+
+    # Post-processing
+    ap.add_argument("--no_tiny_cleanup", action="store_true", help="Disable tiny cleanup after LLM")
+
+    # Optional explicit per-line mode
+    ap.add_argument("--force_per_line", action="store_true", help="Force per-line editing (skip global pass)")
+
     args = ap.parse_args()
 
     p = Path(args.input)
@@ -292,112 +163,69 @@ def main():
         manifest_path = p
         ocr_path = Path(args.ocr) if args.ocr else (p.parent / "ocr_results.json")
     else:
-        raise SystemExit("Input doit être un dossier de crops ou un manifest.json")
+        raise SystemExit("Input must be a folder or a manifest.json file.")
 
     if not manifest_path.exists():
-        raise SystemExit(f"manifest.json introuvable: {manifest_path}")
+        raise SystemExit(f"manifest.json not found: {manifest_path}")
     if not ocr_path.exists():
-        raise SystemExit(f"ocr_results.json introuvable: {ocr_path}")
+        raise SystemExit(f"ocr_results.json not found: {ocr_path}")
 
-    tokens, manifest = load_inputs(manifest_path, ocr_path)
-    if not tokens:
-        print("[reconstruct] Aucun token OCR exploitable.")
-        out = {
-            "source_image": manifest.get("source_image"),
-            "reconstructed": [],
-            "full_text_no_punct": "",
-            "full_text": ""
-        }
-        out_path = manifest_path.parent / "reconstructed.json"
-        out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[reconstruct] Sortie: {out_path}")
-        return
+    # Load for output metadata
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    # COLONNES
-    cols = auto_columns(tokens, n_columns=args.n_columns)
-    n_cols = max(cols) + 1 if cols else 1
+    # 1) Read OCR text
+    raw_text = load_ocr_text(ocr_path)
+    pre = light_preclean(raw_text)
 
-    # Groupes par colonne
-    col_groups: List[List[int]] = [[] for _ in range(n_cols)]
-    for i, c in enumerate(cols):
-        col_groups[c].append(i)
+    # 2) LLM copyedit
+    if args.force_per_line:
+        print(f"[fix] per-line mode | model={args.fix_model} | max_new_tokens={args.max_new_tokens}")
+        final_text = fix_per_line(pre, args.fix_model, args.max_new_tokens)
+    else:
+        fix_prompt = PROMPT_FIX_EN + pre
+        print(f"[fix] model={args.fix_model} | max_new_tokens={args.max_new_tokens}")
+        final_text = run_seq2seq(fix_prompt, args.fix_model, args.max_new_tokens)
+        # Remove possible 'Output:' prefix
+        final_text = re.sub(r"^\s*Output:\s*", "", final_text, flags=re.IGNORECASE).strip()
+        # 2b) Fallback to per-line if the model has summarized or dropped lines
+        input_lines = [l for l in pre.splitlines()]
+        output_lines = [l for l in final_text.splitlines()]
+        too_short = len(final_text) < 0.6 * len(pre)
+        lost_many_lines = abs(len(output_lines) - len(input_lines)) > max(2, int(0.1 * len(input_lines)))
+        if too_short or lost_many_lines:
+            print("[fix] Fallback: per-line mode (output too short or line count mismatch)")
+            final_text = fix_per_line(pre, args.fix_model, args.max_new_tokens)
 
-    # Ordre de lecture des colonnes = x croissant du bord gauche moyen
-    col_order = list(range(n_cols))
-    def col_xmin(cidx):
-        xs = [tokens[i].box.x0 for i in col_groups[cidx]] or [0]
-        return sum(xs) / max(1, len(xs))
-    col_order.sort(key=col_xmin)
+    # 3) Optional tiny cleanup (deterministic)
+    if not args.no_tiny_cleanup:
+        final_text = tiny_cleanup(final_text)
 
-    # RECONSTRUCTION
-    paragraphs_all: List[str] = []
-    paragraphs_all_no_punct: List[str] = []
+    # 4) Optional title
+    title = ""
+    if args.title:
+        model_t = args.title_model or args.fix_model
+        print(f"[title] model={model_t} | max_new_tokens={args.title_max_new_tokens}")
+        title = run_seq2seq(PROMPT_TITLE_EN + final_text, model_t, args.title_max_new_tokens)
 
-    for cidx in col_order:
-        idxs = col_groups[cidx]
-        if not idxs:
-            continue
-        # LIGNES
-        # on transmet uniquement les tokens de la colonne
-        toks_col = [tokens[i] for i in idxs]
-        line_groups = group_lines(toks_col, line_tol=args.line_tol)
-
-        # Map local -> global indices
-        # mais ici on utilise toks_col directement pour la reconstruction
-        lines_text_no_punct: List[str] = []
-        for g in line_groups:
-            words = [toks_col[j] for j in g]
-            line_txt = reconstruct_line(words, space_factor=args.space_factor)
-            if line_txt:
-                lines_text_no_punct.append(line_txt)
-
-        # PARAGRAPHES
-        # Remonte les indices globaux pour calculer gaps verticaux correctement
-        # -> on reconstitue les lignes en indices globaux
-        global_lines: List[List[int]] = []
-        for g in line_groups:
-            global_lines.append([ idxs[j] for j in g ])
-
-        paras = lines_to_paragraphs(global_lines, tokens, para_factor=args.para_factor)
-
-        # Texte reconstruit colonne
-        start_line = 0
-        for para in paras:
-            # nombre de lignes dans ce paragraphe
-            k = len(para)
-            lines = lines_text_no_punct[start_line:start_line + k]
-            start_line += k
-            para_text_no_punct = "\n".join(lines).strip()
-            if not para_text_no_punct:
-                continue
-
-            if args.punct:
-                para_text = apply_punctuation(para_text_no_punct, model_name=args.punct_model, device=args.device).strip()
-            else:
-                para_text = para_text_no_punct
-
-            paragraphs_all_no_punct.append(para_text_no_punct)
-            paragraphs_all.append(para_text)
-
-    # Sorties
-    full_no_punct = "\n\n".join(paragraphs_all_no_punct)
-    full = "\n\n".join(paragraphs_all)
-
+    # 5) Save
+    out_dir = manifest_path.parent
     out = {
         "source_image": manifest.get("source_image"),
-        "reconstructed": [
-            {"paragraph": i, "text_no_punct": paragraphs_all_no_punct[i], "text": paragraphs_all[i]}
-            for i in range(len(paragraphs_all))
-        ],
-        "full_text_no_punct": full_no_punct,
-        "full_text": full,
-        "columns_detected": n_cols
+        "full_text_ocr": raw_text,
+        "final_text": final_text,
+        "title": title,
+        "fix_model": args.fix_model,
     }
-    out_path = manifest_path.parent / "reconstructed.json"
-    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\n=== TEXTE RECONSTRUIT (aperçu) ===")
-    print(full if args.punct else full_no_punct)
-    print(f"\n[reconstruct] Sortie détaillée: {out_path}")
+    (out_dir / "reconstructed.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "text_final.txt").write_text(final_text + "\n", encoding="utf-8")
+    if title:
+        (out_dir / "title.txt").write_text(title + "\n", encoding="utf-8")
+
+    print("\n=== TITLE ===")
+    print(title or "(none)")
+    print("\n=== FINAL TEXT ===")
+    print(final_text)
+    print(f"\n[reconstruct] Output: {out_dir/'reconstructed.json'} | text_final.txt | title.txt")
 
 
 if __name__ == "__main__":

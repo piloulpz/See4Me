@@ -1,0 +1,7 @@
+{
+  "source_image": "new_data/img_test_9.png",
+  "full_text_ocr": "parris .\nlive .\nin\n0 0\ni\nhave two dogs .\nt\nI hope to see you soon\nfish .",
+  "final_text": "Parris. Live. (o, 1l) i have two dogs. T hope to see you soon. Fish.",
+  "title": "Parris",
+  "fix_model": "google/flan-t5-large"
+}

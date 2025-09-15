@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+def run_cmd(cmd: str):
+    print(f"\n>>> {cmd}\n")
+    result = subprocess.run(cmd, shell=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+def main():
+    ap = argparse.ArgumentParser(description="Pipeline complet: segmentation -> TrOCR -> reconstruction (LLM post-edit)")
+    ap.add_argument("image", help="Chemin de l'image à traiter (ex: new_data/img_test_9.png)")
+
+    # Options simples pour l'étape LLM
+    ap.add_argument("--llm_model", default="google/flan-t5-large", help="Modèle seq2seq pour la post-édition (ex: google/flan-t5-large)")
+    ap.add_argument("--llm_tokens", type=int, default=512, help="max_new_tokens pour la post-édition")
+    ap.add_argument("--title", action="store_true", default=True, help="Générer un titre (par défaut ON). Utilise --no-title pour désactiver.")
+    ap.add_argument("--no-title", dest="title", action="store_false")
+
+    # TrOCR tokens (au cas où tu veuilles ajuster)
+    ap.add_argument("--trocr_tokens", type=int, default=128, help="max_new_tokens pour TrOCR")
+
+    # Segmentation basique (tu peux ajuster si besoin)
+    ap.add_argument("--seg_level", choices=["block", "line", "word"], default="line")
+    ap.add_argument("--seg_pad", type=int, default=8)
+    ap.add_argument("--seg_min_area", type=int, default=1500)
+    ap.add_argument("--seg_rotate", type=int, default=0)
+
+    args = ap.parse_args()
+
+    image = Path(args.image)
+    if not image.exists():
+        sys.exit(f"Erreur: fichier introuvable {image}")
+
+    outdir = f"crops_{image.stem}"
+
+    # Étape 1 : segmentation
+    run_cmd(
+        f"python3 segment_blocks.py {image} "
+        f"--outdir {outdir} "
+        f"--level {args.seg_level} --pad {args.seg_pad} "
+        f"--min_area {args.seg_min_area} --rotate {args.seg_rotate}"
+    )
+
+    # Étape 2 : OCR avec TrOCR
+    run_cmd(
+        f"python3 trocr_batch.py {outdir}/manifest.json --max_new_tokens {args.trocr_tokens}"
+    )
+
+    # Étape 3 : Reconstruction par LLM (script minimal)
+    cmd_recon = (
+        f"python3 reconstruct_sentences.py {outdir} "
+        f"--fix_model {args.llm_model} --max_new_tokens {args.llm_tokens}"
+    )
+    if args.title:
+        cmd_recon += " --title"
+    run_cmd(cmd_recon)
+
+    print(f"\n[main] Terminé. Résultats dans: {outdir} (reconstructed.json, text_final.txt, title.txt)")
+
+if __name__ == "__main__":
+    main()

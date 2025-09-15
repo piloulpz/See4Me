@@ -1,0 +1,60 @@
+{
+  "manifest": {
+    "source_image": "new_data/img_test_8.png",
+    "level": "line",
+    "rotate": 0
+  },
+  "results": [
+    {
+      "index": 0,
+      "path": "crops_img_test_8/line_00000.png",
+      "text": "She is studying English at school"
+    },
+    {
+      "index": 1,
+      "path": "crops_img_test_8/line_00001.png",
+      "text": "are going to the park tomorrow"
+    },
+    {
+      "index": 2,
+      "path": "crops_img_test_8/line_00002.png",
+      "text": "une"
+    },
+    {
+      "index": 3,
+      "path": "crops_img_test_8/line_00003.png",
+      "text": "They live ."
+    },
+    {
+      "index": 4,
+      "path": "crops_img_test_8/line_00004.png",
+      "text": "citey ."
+    },
+    {
+      "index": 5,
+      "path": "crops_img_test_8/line_00005.png",
+      "text": "in a"
+    },
+    {
+      "index": 6,
+      "path": "crops_img_test_8/line_00006.png",
+      "text": "I am happy"
+    },
+    {
+      "index": 7,
+      "path": "crops_img_test_8/line_00007.png",
+      "text": "I read books ."
+    },
+    {
+      "index": 8,
+      "path": "crops_img_test_8/line_00008.png",
+      "text": "My favorite color is blue ."
+    },
+    {
+      "index": 9,
+      "path": "crops_img_test_8/line_00009.png",
+      "text": "He plays videogames ."
+    }
+  ],
+  "full_text": "She is studying English at school\nare going to the park tomorrow\nune\nThey live .\ncitey .\nin a\nI am happy\nI read books .\nMy favorite color is blue .\nHe plays videogames ."
+}

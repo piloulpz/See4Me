@@ -57,7 +57,7 @@ def main():
     W, H = image.width, image.height
 
     # Affiche la version réellement utilisée
-    image.show()
+    #image.show()
 
     # Device
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():

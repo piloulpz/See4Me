@@ -26,7 +26,7 @@
         2201,
         882
       ],
-      "path": "crops_img/line_00000.png"
+      "path": "crops_img_test_9/line_00000.png"
     },
     {
       "id": 1,
@@ -47,7 +47,7 @@
         1221,
         890
       ],
-      "path": "crops_img/line_00001.png"
+      "path": "crops_img_test_9/line_00001.png"
     },
     {
       "id": 2,
@@ -68,7 +68,7 @@
         1492,
         858
       ],
-      "path": "crops_img/line_00002.png"
+      "path": "crops_img_test_9/line_00002.png"
     },
     {
       "id": 3,
@@ -89,7 +89,7 @@
         1461,
         721
       ],
-      "path": "crops_img/line_00003.png"
+      "path": "crops_img_test_9/line_00003.png"
     },
     {
       "id": 4,
@@ -110,7 +110,7 @@
         599,
         870
       ],
-      "path": "crops_img/line_00004.png"
+      "path": "crops_img_test_9/line_00004.png"
     },
     {
       "id": 5,
@@ -131,7 +131,7 @@
         1579,
         1414
       ],
-      "path": "crops_img/line_00005.png"
+      "path": "crops_img_test_9/line_00005.png"
     },
     {
       "id": 6,
@@ -152,7 +152,7 @@
         532,
         1422
       ],
-      "path": "crops_img/line_00006.png"
+      "path": "crops_img_test_9/line_00006.png"
     },
     {
       "id": 7,
@@ -173,7 +173,7 @@
         1882,
         1859
       ],
-      "path": "crops_img/line_00007.png"
+      "path": "crops_img_test_9/line_00007.png"
     },
     {
       "id": 8,
@@ -194,7 +194,7 @@
         2871,
         2158
       ],
-      "path": "crops_img/line_00008.png"
+      "path": "crops_img_test_9/line_00008.png"
     }
   ]
 }
