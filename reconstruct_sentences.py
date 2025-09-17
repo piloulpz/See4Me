@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-reconstruct_sentences.py (minimal LLM post-edit, robust)
-- Reads OCR text from ocr_results.json
-- Sends it to a seq2seq LLM with a copyediting prompt
-- Writes final text (and optional title)
-- Preserves ALL lines; falls back to per-line editing if needed
-- Graceful fallback if transformers is missing (returns precleaned OCR)
+reconstruct_sentences.py (LLM post-edit, aligné au fine-tune + fallback amélioré)
+- Lit un texte OCR depuis ocr_results.json
+- Envoie le texte à un modèle seq2seq (prompt cohérent avec le fine-tune)
+- Écrit le texte final (et un titre optionnel)
+- Préserve toutes les lignes; fallback ligne-à-ligne si besoin (consigne plus "prof")
+- Fallback gracieux si transformers est manquant (retourne l'OCR pré-nettoyé)
 
 Usage:
   python3 reconstruct_sentences.py <folder|manifest.json> [--ocr OCR_PATH]
-    [--fix_model google/flan-t5-large] [--max_new_tokens 512]
-    [--title] [--title_model MODEL] [--title_max_new_tokens 32]
-    [--no_tiny_cleanup]
+    [--fix_model ouiyam/see4me-flan5-rewriter-base] [--max_new_tokens 160]
+    [--title] [--title_model MODEL] [--title_max_new_tokens 16]
+    [--no_tiny_cleanup] [--force_per_line]
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Optional
 
 _HAS_TRANSFORMERS = False
 try:
@@ -32,17 +31,22 @@ except Exception:
 
 
 # ====== Prompts ======
-# Global prompt: insist on preserving ALL lines and counts.
-PROMPT_FIX_EN = (
-    "Fix the following text in English. You have to detect all the words and anomalies in the sentences. Put them together to make the text readble\n"
-    "Delete all the sentences which are not english\n"
-    "Text :\n\n"
+# Instruction globale (même esprit que le dataset de fine-tune) + wrapper Text:
+INSTRUCTION_EN = (
+    "Rewrite this noisy OCR text into one clean, well-ordered paragraph. "
+    "Fix casing, punctuation, and obvious spelling mistakes, and reorder lines if needed. "
+    "Keep the meaning unchanged. Output in English."
 )
 
+# Pour le titre (optionnel)
 PROMPT_TITLE_EN = (
     "Suggest a concise (≤8 words), informative, natural title for this text. "
     "Answer with the title only:\n\n"
 )
+
+def make_fix_prompt(text: str) -> str:
+    """Construit le prompt EXACTEMENT comme au fine-tune : instruction + 'Text:' + texte."""
+    return f"{INSTRUCTION_EN}\n\nText:\n\n{text}\n\n"
 
 
 # ====== I/O helpers ======
@@ -72,14 +76,14 @@ def light_preclean(t: str) -> str:
 
 
 def tiny_cleanup(s: str) -> str:
-    """Small deterministic cleanup after the LLM to guarantee removal of common OCR noise."""
+    """Nettoyage déterministe après LLM pour ôter quelques bruits OCR courants."""
     if not s:
         return s
     s = re.sub(r"^\s*Output:\s*", "", s, flags=re.IGNORECASE)  # remove 'Output:' prefix if echoed
     s = re.sub(r"\b0 0\b", "", s)                              # remove '0 0' noise
     s = re.sub(r"(?<=[A-Za-z])0(?=[A-Za-z])", "o", s)
     s = re.sub(r"(?<=[A-Za-z])1(?=[A-Za-z])", "l", s)
-    # remove isolated single letters that stand alone as tokens (common stray 't', 'i' etc.)
+    # remove isolated single letters that stand alone as tokens (common stray 't', 'i', etc.)
     s = re.sub(r"(?:^|\s)\b([A-Za-z])\b(?:[. ]+|$)", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     # Capitalize sentence starts
@@ -92,8 +96,10 @@ def tiny_cleanup(s: str) -> str:
 # ====== LLM runner ======
 def run_seq2seq(prompt: str, model_name: str, max_new_tokens: int) -> str:
     if not _HAS_TRANSFORMERS:
-        # Fallback: return the input text part (after "Text:\n") if transformers is unavailable
-        return prompt.split("\n\nText:\n", 1)[-1].strip()
+        # Fallback: retourner le bloc après "Text:\n" si transformers indisponible
+        if "\n\nText:\n\n" in prompt:
+            return prompt.split("\n\nText:\n\n", 1)[-1].strip()
+        return prompt.strip()
     try:
         tok = AutoTokenizer.from_pretrained(model_name)
         mdl = AutoModelForSeq2SeqLM.from_pretrained(model_name)
@@ -108,23 +114,30 @@ def run_seq2seq(prompt: str, model_name: str, max_new_tokens: int) -> str:
         )
         return tok.decode(ids[0], skip_special_tokens=True).strip()
     except Exception:
-        # If anything fails, return the raw text (still better than crashing)
-        return prompt.split("\n\nText:\n", 1)[-1].strip()
+        # Si quelque chose échoue, renvoyer le texte brut (mieux que planter)
+        if "\n\nText:\n\n" in prompt:
+            return prompt.split("\n\nText:\n\n", 1)[-1].strip()
+        return prompt.strip()
 
 
 def fix_per_line(text: str, model_name: str, max_new_tokens: int) -> str:
-    """Edit each line independently to strictly preserve line count."""
+    """
+    Édite chaque ligne indépendamment en conservant le format de prompt du fine-tune.
+    Version "prof" : autorise la complétion minimale (sujet/auxiliaire manquant) et corrige OCR évident.
+    """
     lines = text.splitlines()
     out_lines = []
     for ln in lines:
         if not ln.strip():
-            out_lines.append("")  # preserve blank lines
+            out_lines.append("")  # préserver les lignes vides
             continue
         prompt = (
-            "Edit ONLY this one line. Keep its meaning and keep all words unless they are clear OCR noise. "
-            "Fix spelling, grammar, casing, spacing, and punctuation; remove OCR noise (0→o, 1→l). "
-            "Return ONLY the corrected line:\n\n"
-            f"{ln.strip()}"
+            "Rewrite this single OCR line into correct English as a standalone sentence. "
+            "Fix casing, grammar, punctuation, and obvious OCR mistakes (e.g., 0→o, 1→l, 'citey'→'city'). "
+            "If the subject or auxiliary is clearly missing, add the minimal natural completion. "
+            "Return ONLY the corrected sentence.\n\n"
+            "Text:\n\n"
+            f"{ln.strip()}\n\n"
         )
         y = run_seq2seq(prompt, model_name, max_new_tokens)
         y = re.sub(r"^\s*Output:\s*", "", y, flags=re.IGNORECASE).strip()
@@ -134,24 +147,24 @@ def fix_per_line(text: str, model_name: str, max_new_tokens: int) -> str:
 
 # ====== Main ======
 def main():
-    ap = argparse.ArgumentParser(description="Minimal LLM post-edit on OCR text (line-preserving).")
-    ap.add_argument("input", help="Folder with manifest.json + ocr_results.json OR the manifest.json path")
-    ap.add_argument("--ocr", help="Path to ocr_results.json (else inferred)")
+    ap = argparse.ArgumentParser(description="Minimal LLM post-edit on OCR text (line-preserving), prompt aligné au fine-tune.")
+    ap.add_argument("input", help="Dossier avec manifest.json + ocr_results.json OU chemin direct vers manifest.json")
+    ap.add_argument("--ocr", help="Chemin vers ocr_results.json (sinon inféré)")
 
-    # Models & gen params
-    ap.add_argument("--fix_model", default="google/flan-t5-large", help="Seq2seq model for copyediting")
-    ap.add_argument("--max_new_tokens", type=int, default=512, help="Max new tokens for the copyedit model")
+    # Modèle & génération
+    ap.add_argument("--fix_model", default="ouiyam/see4me-flan5-rewriter-base", help="Checkpoint seq2seq fine-tuné pour la réécriture")
+    ap.add_argument("--max_new_tokens", type=int, default=160, help="Max new tokens pour la génération (160 conseillé)")
 
-    # Optional title
-    ap.add_argument("--title", action="store_true", help="Also generate a title")
-    ap.add_argument("--title_model", default=None, help="Optional different model for title generation")
-    ap.add_argument("--title_max_new_tokens", type=int, default=32, help="Max new tokens for title")
+    # Titre (optionnel)
+    ap.add_argument("--title", action="store_true", help="Générer aussi un titre")
+    ap.add_argument("--title_model", default=None, help="Modèle pour le titre (par défaut: fix_model)")
+    ap.add_argument("--title_max_new_tokens", type=int, default=16, help="Max new tokens pour le titre")
 
     # Post-processing
-    ap.add_argument("--no_tiny_cleanup", action="store_true", help="Disable tiny cleanup after LLM")
+    ap.add_argument("--no_tiny_cleanup", action="store_true", help="Désactiver le tiny cleanup après LLM")
 
-    # Optional explicit per-line mode
-    ap.add_argument("--force_per_line", action="store_true", help="Force per-line editing (skip global pass)")
+    # Mode ligne-à-ligne explicite
+    ap.add_argument("--force_per_line", action="store_true", help="Forcer l'édition par ligne (skip le passage global)")
 
     args = ap.parse_args()
 
@@ -170,10 +183,10 @@ def main():
     if not ocr_path.exists():
         raise SystemExit(f"ocr_results.json not found: {ocr_path}")
 
-    # Load for output metadata
+    # Métadonnées pour la sortie
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    # 1) Read OCR text
+    # 1) Lire le texte OCR
     raw_text = load_ocr_text(ocr_path)
     pre = light_preclean(raw_text)
 
@@ -182,32 +195,33 @@ def main():
         print(f"[fix] per-line mode | model={args.fix_model} | max_new_tokens={args.max_new_tokens}")
         final_text = fix_per_line(pre, args.fix_model, args.max_new_tokens)
     else:
-        fix_prompt = PROMPT_FIX_EN + pre
+        fix_prompt = make_fix_prompt(pre)  # <<< Aligné avec le fine-tune
         print(f"[fix] model={args.fix_model} | max_new_tokens={args.max_new_tokens}")
         final_text = run_seq2seq(fix_prompt, args.fix_model, args.max_new_tokens)
-        # Remove possible 'Output:' prefix
+        # Retirer un éventuel 'Output:' préfixé par le modèle
         final_text = re.sub(r"^\s*Output:\s*", "", final_text, flags=re.IGNORECASE).strip()
-        # 2b) Fallback to per-line if the model has summarized or dropped lines
-        input_lines = [l for l in pre.splitlines()]
-        output_lines = [l for l in final_text.splitlines()]
-        too_short = len(final_text) < 0.6 * len(pre)
-        lost_many_lines = abs(len(output_lines) - len(input_lines)) > max(2, int(0.1 * len(input_lines)))
-        if too_short or lost_many_lines:
-            print("[fix] Fallback: per-line mode (output too short or line count mismatch)")
+
+        # 2b) Fallback ligne-à-ligne UNIQUEMENT si sortie vraiment trop courte
+        # (on n'utilise plus l'écart de lignes pour forcer le fallback)
+        too_short = len(final_text) < 0.3 * len(pre)
+        if too_short:
+            print("[fix] Fallback: per-line mode (very short output)")
             final_text = fix_per_line(pre, args.fix_model, args.max_new_tokens)
 
-    # 3) Optional tiny cleanup (deterministic)
+    # 3) Nettoyage déterministe optionnel
     if not args.no_tiny_cleanup:
         final_text = tiny_cleanup(final_text)
 
-    # 4) Optional title
+    # 4) Titre optionnel
     title = ""
     if args.title:
         model_t = args.title_model or args.fix_model
         print(f"[title] model={model_t} | max_new_tokens={args.title_max_new_tokens}")
+        # Ici, le prompt titre n’a pas été fine-tuné — on l’assume comme tâche distincte
         title = run_seq2seq(PROMPT_TITLE_EN + final_text, model_t, args.title_max_new_tokens)
+        title = re.sub(r"^\s*Output:\s*", "", title, flags=re.IGNORECASE).strip()
 
-    # 5) Save
+    # 5) Sauvegarde
     out_dir = manifest_path.parent
     out = {
         "source_image": manifest.get("source_image"),

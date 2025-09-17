@@ -1,2 +1,30 @@
-data/train_merged.jsonl
+# === Python basics ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === Logs & temp ===
+*.log
+*.tmp
+
+# === Images & OCR crops (gros dossiers inutiles dans Git) ===
+crops_*/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# === Model checkpoints & outputs ===
+outputs/
+checkpoints/
+runs/
+wandb/
+
+# === Datasets (on garde data/ complet sauf le fichier trop lourd) ===
 data/train_merged.jsonl

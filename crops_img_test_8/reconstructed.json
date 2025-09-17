@@ -1,7 +1,7 @@
 {
   "source_image": "new_data/img_test_8.png",
   "full_text_ocr": "She is studying English at school\nare going to the park tomorrow\nune\nThey live .\ncitey .\nin a\nI am happy\nI read books .\nMy favorite color is blue .\nHe plays videogames .",
-  "final_text": "She is studying English at school. Are going to the park tomorrow. Une They live. Citey. In a am happy read books. My favorite color is blue. He plays videogames.",
-  "title": "What does he do?",
-  "fix_model": "google/flan-t5-large"
+  "final_text": "She is studying English at school are going to the park tomorrow. They live. Am happy. Read books. My favorite color is blue. He plays videogames.",
+  "title": "She is studying English at school",
+  "fix_model": "outputs/flan5-rewriter-base"
 }
